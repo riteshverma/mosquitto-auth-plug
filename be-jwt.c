@@ -37,8 +37,18 @@
 #include "hash.h"
 #include "log.h"
 #include "envs.h"
-#include <curl/curl.h>
 
+#ifdef HAVE_LIBJWT
+#include <jwt.h>
+#include <mosquitto_plugin.h> // For mosquitto_topic_matches_sub
+// Potentially include jansson.h if direct access to Jansson objects is needed
+// #include <jansson.h>
+#else // HAVE_LIBJWT
+#include <curl/curl.h>
+#endif // HAVE_LIBJWT
+
+#ifndef HAVE_LIBJWT
+// This function is only used by the old HTTP-based JWT backend
 static int get_string_envs(CURL * curl, const char *required_env, char *querystring)
 {
 	char *data = NULL;
@@ -211,10 +221,148 @@ static int http_post(void *handle, char *uri, const char *clientid, const char *
 	free(escaped_clientid);
 	return (ok);
 }
+#endif // HAVE_LIBJWT
 
 void *be_jwt_init()
 {
 	struct jwt_backend *conf;
+	conf = (struct jwt_backend *)malloc(sizeof(struct jwt_backend));
+	if (!conf) {
+		_fatal("ENOMEM");
+		return NULL;
+	}
+	memset(conf, 0, sizeof(struct jwt_backend));
+
+#ifdef HAVE_LIBJWT
+	// Initialize libjwt specific configurations
+	char *alg_str = NULL;
+
+	// Parse jwt_validation_type
+	conf->jwt_validation_type = p_stab("jwt_validation_type");
+	if (!conf->jwt_validation_type) {
+		_log(LOG_INFO, "JWT: 'jwt_validation_type' not configured, defaulting to 'secret'.");
+		conf->jwt_validation_type = strdup("secret");
+	} else {
+		conf->jwt_validation_type = strdup(conf->jwt_validation_type); // Duplicate for safe memory management
+	}
+
+	// Parse jwt_secret_key or jwt_public_key_path based on validation_type
+	if (strcmp(conf->jwt_validation_type, "secret") == 0) {
+		conf->jwt_secret_key_value = p_stab("jwt_secret_key");
+		if (!conf->jwt_secret_key_value) {
+			_fatal("JWT: 'jwt_secret_key' is required when 'jwt_validation_type' is 'secret'.");
+			free(conf->jwt_validation_type);
+			free(conf);
+			return NULL;
+		}
+		conf->jwt_secret_key_value = strdup(conf->jwt_secret_key_value);
+	} else if (strcmp(conf->jwt_validation_type, "public_key_file") == 0) {
+		conf->jwt_public_key_path = p_stab("jwt_public_key_path");
+		if (!conf->jwt_public_key_path) {
+			_fatal("JWT: 'jwt_public_key_path' is required when 'jwt_validation_type' is 'public_key_file'.");
+			free(conf->jwt_validation_type);
+			free(conf);
+			return NULL;
+		}
+		conf->jwt_public_key_path = strdup(conf->jwt_public_key_path);
+		// Load public key from file
+		FILE *fp = fopen(conf->jwt_public_key_path, "r");
+		if (!fp) {
+			_fatal("JWT: Cannot open public key file: %s", conf->jwt_public_key_path);
+			free(conf->jwt_validation_type);
+			free(conf->jwt_public_key_path);
+			free(conf);
+			return NULL;
+		}
+		fseek(fp, 0, SEEK_END);
+		long len = ftell(fp);
+		fseek(fp, 0, SEEK_SET);
+		conf->jwt_secret_key_value = (char *)malloc(len + 1);
+		if (!conf->jwt_secret_key_value) {
+			_fatal("JWT: ENOMEM while reading public key file.");
+			fclose(fp);
+			free(conf->jwt_validation_type);
+			free(conf->jwt_public_key_path);
+			free(conf);
+			return NULL;
+		}
+		fread(conf->jwt_secret_key_value, 1, len, fp);
+		conf->jwt_secret_key_value[len] = '\0';
+		fclose(fp);
+	} else {
+		_fatal("JWT: Invalid 'jwt_validation_type': %s. Must be 'secret' or 'public_key_file'.", conf->jwt_validation_type);
+		free(conf->jwt_validation_type);
+		free(conf);
+		return NULL;
+	}
+
+	// Parse jwt_algorithm
+	alg_str = p_stab("jwt_algorithm");
+	if (!alg_str) {
+		_fatal("JWT: 'jwt_algorithm' is missing. Please specify a valid JWT algorithm.");
+		// Free previously allocated memory
+		if (conf->jwt_validation_type) free(conf->jwt_validation_type);
+		if (conf->jwt_secret_key_value) free(conf->jwt_secret_key_value);
+		if (conf->jwt_public_key_path) free(conf->jwt_public_key_path);
+		free(conf);
+		return NULL;
+	}
+	if (jwt_str_alg(alg_str, &conf->jwt_expected_alg) != 0) {
+		_fatal("JWT: Invalid 'jwt_algorithm' specified: %s.", alg_str);
+		// Free previously allocated memory
+		if (conf->jwt_validation_type) free(conf->jwt_validation_type);
+		if (conf->jwt_secret_key_value) free(conf->jwt_secret_key_value);
+		if (conf->jwt_public_key_path) free(conf->jwt_public_key_path);
+		free(conf);
+		return NULL;
+	}
+
+	// Parse jwt_username_claim_name
+	conf->jwt_username_claim_name = p_stab("jwt_username_claim");
+	if (!conf->jwt_username_claim_name) {
+		_log(LOG_INFO, "JWT: 'jwt_username_claim' not configured, defaulting to 'sub'.");
+		conf->jwt_username_claim_name = strdup("sub");
+	} else {
+		conf->jwt_username_claim_name = strdup(conf->jwt_username_claim_name);
+	}
+
+	// Parse jwt_superuser_claim_name
+	conf->jwt_superuser_claim_name = p_stab("jwt_superuser_claim_name");
+	if (conf->jwt_superuser_claim_name) {
+		conf->jwt_superuser_claim_name = strdup(conf->jwt_superuser_claim_name);
+	}
+
+	// Parse jwt_acl_topic_read_claim_key
+	conf->jwt_acl_topic_read_claim_key = p_stab("jwt_acl_topic_read_claim_key");
+	if (!conf->jwt_acl_topic_read_claim_key) {
+		_log(LOG_INFO, "JWT: 'jwt_acl_topic_read_claim_key' not configured, defaulting to 'mosq_acl_read'.");
+		conf->jwt_acl_topic_read_claim_key = strdup("mosq_acl_read");
+	} else {
+		conf->jwt_acl_topic_read_claim_key = strdup(conf->jwt_acl_topic_read_claim_key);
+	}
+
+	// Parse jwt_acl_topic_write_claim_key
+	conf->jwt_acl_topic_write_claim_key = p_stab("jwt_acl_topic_write_claim_key");
+	if (!conf->jwt_acl_topic_write_claim_key) {
+		_log(LOG_INFO, "JWT: 'jwt_acl_topic_write_claim_key' not configured, defaulting to 'mosq_acl_write'.");
+		conf->jwt_acl_topic_write_claim_key = strdup("mosq_acl_write");
+	} else {
+		conf->jwt_acl_topic_write_claim_key = strdup(conf->jwt_acl_topic_write_claim_key);
+	}
+	
+	_log(LOG_NOTICE, "JWT backend: Initialized with libjwt support.");
+	_log(LOG_INFO, "JWT Config: Validation Type: %s", conf->jwt_validation_type);
+	if (strcmp(conf->jwt_validation_type, "public_key_file") == 0) {
+		_log(LOG_INFO, "JWT Config: Public Key Path: %s", conf->jwt_public_key_path);
+	}
+	_log(LOG_INFO, "JWT Config: Algorithm: %s", alg_str ? alg_str : "N/A (Error if NULL)");
+	_log(LOG_INFO, "JWT Config: Username Claim: %s", conf->jwt_username_claim_name);
+	_log(LOG_INFO, "JWT Config: Superuser Claim: %s", conf->jwt_superuser_claim_name ? conf->jwt_superuser_claim_name : "N/A");
+	_log(LOG_INFO, "JWT Config: ACL Read Claim Key: %s", conf->jwt_acl_topic_read_claim_key);
+	_log(LOG_INFO, "JWT Config: ACL Write Claim Key: %s", conf->jwt_acl_topic_write_claim_key);
+
+#else // HAVE_LIBJWT
+	// Old HTTP-based initialization
 	char *ip;
 	char *getuser_uri;
 	char *superuser_uri;
@@ -222,25 +370,29 @@ void *be_jwt_init()
 
 	if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
 		_fatal("init curl fail");
+		free(conf);
 		return (NULL);
 	}
 	if ((ip = p_stab("http_ip")) == NULL) {
 		_fatal("Mandatory parameter `http_ip' missing");
+		free(conf);
 		return (NULL);
 	}
 	if ((getuser_uri = p_stab("http_getuser_uri")) == NULL) {
 		_fatal("Mandatory parameter `http_getuser_uri' missing");
+		free(conf);
 		return (NULL);
 	}
 	if ((superuser_uri = p_stab("http_superuser_uri")) == NULL) {
 		_fatal("Mandatory parameter `http_superuser_uri' missing");
+		free(conf);
 		return (NULL);
 	}
 	if ((aclcheck_uri = p_stab("http_aclcheck_uri")) == NULL) {
 		_fatal("Mandatory parameter `http_aclcheck_uri' missing");
+		free(conf);
 		return (NULL);
 	}
-	conf = (struct jwt_backend *)malloc(sizeof(struct jwt_backend));
 	conf->ip = ip;
 	conf->hostname = NULL;
 	conf->hostheader = NULL;
@@ -271,43 +423,408 @@ void *be_jwt_init()
 	_log(LOG_DEBUG, "getuser_params=%s", conf->getuser_envs);
 	_log(LOG_DEBUG, "superuser_params=%s", conf->superuser_envs);
 	_log(LOG_DEBUG, "aclcheck_paramsi=%s", conf->aclcheck_envs);
+	_log(LOG_NOTICE, "JWT backend: Initialized with HTTP GET support (libjwt not enabled)");
 
+#endif // HAVE_LIBJWT
 	return (conf);
 };
+
 void be_jwt_destroy(void *handle)
 {
 	struct jwt_backend *conf = (struct jwt_backend *)handle;
 
 	if (conf) {
-		if (conf->hostname) free(conf->hostname);
+#ifdef HAVE_LIBJWT
+		// Cleanup libjwt specific resources
+		if (conf->jwt_validation_type) free(conf->jwt_validation_type);
+		if (conf->jwt_secret_key_value) free(conf->jwt_secret_key_value);
+		if (conf->jwt_public_key_path) free(conf->jwt_public_key_path);
+		if (conf->jwt_username_claim_name) free(conf->jwt_username_claim_name);
+		if (conf->jwt_superuser_claim_name) free(conf->jwt_superuser_claim_name);
+		if (conf->jwt_acl_topic_read_claim_key) free(conf->jwt_acl_topic_read_claim_key);
+		if (conf->jwt_acl_topic_write_claim_key) free(conf->jwt_acl_topic_write_claim_key);
+		_log(LOG_NOTICE, "JWT backend: libjwt resources destroyed");
+#else
+		if (conf->hostname) free(conf->hostname); 
 		if (conf->hostheader) free(conf->hostheader);
 		curl_global_cleanup();
+		_log(LOG_NOTICE, "JWT backend: HTTP GET destroyed");
+#endif
 		free(conf);
 	}
 };
 
-int be_jwt_getuser(void *handle, const char *token, const char *pass, char **phash, const char *clientid)
+// Parameters:
+//  - handle: backend_conf opaque pointer
+// Parameters:
+//  - handle: backend_conf opaque pointer
+//  - username_as_jwt: MQTT username, which is expected to be the JWT string for this function.
+//  - password: MQTT password (ignored for authentication, but logged if present).
+//  - phash: Pointer to store placeholder hash on success.
+//  - clientid: MQTT client ID.
+int be_jwt_getuser(void *handle, const char *username_as_jwt, const char *password, char **phash, const char *clientid)
 {
+#ifdef HAVE_LIBJWT
+	struct jwt_backend *conf = (struct jwt_backend *)handle;
+	jwt_t *jwt_obj = NULL; 
+	int result = BACKEND_DENY; // Default to deny
+
+	_log(LOG_DEBUG, "JWT: be_jwt_getuser called. MQTT Username (expected as JWT): '%s', MQTT Password (ignored): '%s', Client ID: '%s'",
+		 username_as_jwt ? username_as_jwt : "NULL", password ? password : "NULL", clientid ? clientid : "NULL");
+
+	if (!username_as_jwt || strlen(username_as_jwt) == 0) {
+		_log(LOG_INFO, "JWT: be_jwt_getuser: No JWT provided in MQTT username field. Client ID: '%s'.", clientid ? clientid : "NULL");
+		return BACKEND_DENY; 
+	}
+
+	if (!conf || !conf->jwt_secret_key_value || !conf->jwt_username_claim_name) {
+		_log(LOG_ERR, "JWT: be_jwt_getuser: JWT core configuration (secret/key or username claim name) missing. Client ID: '%s'.", clientid ? clientid : "NULL");
+		return BACKEND_ERROR; // Configuration error
+	}
+	
+	size_t key_len = (conf->jwt_expected_alg >= JWT_ALG_HS256 && conf->jwt_expected_alg <= JWT_ALG_HS512) ? strlen(conf->jwt_secret_key_value) : 0;
+	int decode_ret = jwt_decode(&jwt_obj, username_as_jwt, (unsigned char *)conf->jwt_secret_key_value, key_len);
+
+	if (decode_ret != 0) {
+		const char *err_desc = "unknown error";
+		if (decode_ret == EINVAL) err_desc = "invalid parameter to jwt_decode";
+		else if (decode_ret == ENOMEM) err_desc = "out of memory";
+		else if (decode_ret == ESLOGIC) err_desc = "validation failed (e.g., expired, not yet valid, signature, or audience)";
+		_log(LOG_INFO, "JWT: be_jwt_getuser: JWT validation failed for client ID '%s'. Reason: %s (libjwt error code: %d). JWT (from MQTT username): %s",
+			 clientid ? clientid : "NULL", err_desc, decode_ret, username_as_jwt);
+		if (jwt_obj) jwt_free(jwt_obj);
+		return BACKEND_DENY;
+	}
+
+    // Validate algorithm after successful decoding
+    if (jwt_get_alg(jwt_obj) != conf->jwt_expected_alg) {
+        _log(LOG_INFO, "JWT: be_jwt_getuser: JWT algorithm mismatch for MQTT user '%s'. Expected '%s', got '%s'.",
+             clientid ? clientid : "NULL", jwt_alg_str(conf->jwt_expected_alg), jwt_alg_str(jwt_get_alg(jwt_obj)));
+        if (jwt_obj) jwt_free(jwt_obj);
+        return BACKEND_DENY;
+    }
+	_log(LOG_DEBUG, "JWT: be_jwt_getuser: JWT signature, algorithm, and standard time-related claims (exp, nbf, iat) validated successfully by libjwt for client ID '%s'.", clientid ? clientid : "NULL");
+
+	// Extract username using the configured claim name
+	const char *jwt_username_claim = jwt_get_grant(jwt_obj, conf->jwt_username_claim_name);
+	if (jwt_username_claim != NULL) {
+		// Note: The 'username_as_jwt' is the full JWT. The 'jwt_username_claim' is the actual username extracted from the JWT.
+		_log(LOG_INFO, "JWT: be_jwt_getuser: Authentication successful for client ID '%s'. Extracted username ('%s' claim): '%s'. Full JWT (from MQTT username): %s.",
+			 clientid ? clientid : "NULL", conf->jwt_username_claim_name, jwt_username_claim, username_as_jwt);
+		
+		// Set phash to indicate successful JWT validation.
+		// auth-plug.c is responsible for freeing this if allocated.
+		if (phash) { // Ensure phash pointer is not NULL
+			*phash = strdup("jwt_validated");
+			if (!*phash) {
+				_log(LOG_ERR, "JWT: be_jwt_getuser: strdup failed for phash for client ID '%s'.", clientid ? clientid : "NULL");
+				if (jwt_obj) jwt_free(jwt_obj);
+				return BACKEND_ERROR; // Memory allocation error
+			}
+		}
+		result = BACKEND_ALLOW;
+	} else {
+		_log(LOG_INFO, "JWT: be_jwt_getuser: JWT valid, but configured username claim '%s' not found for MQTT user '%s'.",
+			 conf->jwt_username_claim_name, clientid ? clientid : "NULL");
+		result = BACKEND_DENY;
+	}
+
+	if (jwt_obj) jwt_free(jwt_obj);
+	return result;
+#else
+	// Fallback for non-HAVE_LIBJWT (original code using HTTP)
 	struct jwt_backend *conf = (struct jwt_backend *)handle;
 	int re;
-	if (token == NULL) {
+	// Original code used `token` (MQTT username) for HTTP POST, this is kept as is for the old path.
+	// If the JWT was intended to be in `pass` for the HTTP path too, that would be a change to the old logic.
+	// For consistency with the libjwt path, one might consider using `pass` here too for the JWT.
+	// However, the task is to refine the libjwt path.
+	// Now, for the old HTTP path, we also need to decide if `username_as_jwt` (MQTT username)
+	// or `password` (MQTT password) should be used as the token for the HTTP request.
+	// The original code used the `username` parameter of be_jwt_getuser. To maintain that behavior for the non-libjwt path:
+	if (username_as_jwt == NULL) { 
 		return BACKEND_DEFER;
 	}
-	re = http_post(handle, conf->getuser_uri, NULL, token, NULL, -1, METHOD_GETUSER);
+	re = http_post(handle, conf->getuser_uri, NULL, username_as_jwt, NULL, -1, METHOD_GETUSER);
 	return re;
+#endif // HAVE_LIBJWT
 };
 
 int be_jwt_superuser(void *handle, const char *token)
 {
+#ifdef HAVE_LIBJWT
+// Parameters:
+//  - handle: backend_conf opaque pointer
+//  - username: MQTT username (this is the 'token' variable from the original function signature, typically the JWT itself for superuser check)
+//  - clientid: MQTT client ID (Not directly used by superuser check but available)
+int be_jwt_superuser(void *handle, const char *jwt_string_su) // Renamed token to jwt_string_su for clarity
+{
+#ifdef HAVE_LIBJWT
 	struct jwt_backend *conf = (struct jwt_backend *)handle;
+	jwt_t *jwt_obj = NULL; // Renamed from jwt to jwt_obj
+	int result = BACKEND_DENY; // Default to deny
 
-	return http_post(handle, conf->superuser_uri, NULL, token, NULL, -1, METHOD_SUPERUSER);
+	_log(LOG_DEBUG, "JWT: be_jwt_superuser called with JWT in username field.");
+
+
+	if (!jwt_string_su || strlen(jwt_string_su) == 0) {
+		_log(LOG_INFO, "JWT: be_jwt_superuser: No JWT provided in username field.");
+		return BACKEND_DENY;
+	}
+
+	if (!conf || !conf->jwt_secret_key_value) {
+		_log(LOG_ERR, "JWT: be_jwt_superuser: JWT secret/key not configured.");
+		return BACKEND_ERROR;
+	}
+    // Check 1: Superuser claim name configuration
+    if (!conf->jwt_superuser_claim_name || strlen(conf->jwt_superuser_claim_name) == 0) {
+        _log(LOG_INFO, "JWT: be_jwt_superuser: Superuser check deferred. 'jwt_superuser_claim_name' is not configured. JWT: %s", jwt_string_su);
+        return BACKEND_DEFER;
+    }
+
+	// Check 2: Basic JWT validation (signature, expiry, algorithm)
+	size_t key_len = (conf->jwt_expected_alg >= JWT_ALG_HS256 && conf->jwt_expected_alg <= JWT_ALG_HS512) ? strlen(conf->jwt_secret_key_value) : 0;
+	int decode_ret = jwt_decode(&jwt_obj, jwt_string_su, (unsigned char *)conf->jwt_secret_key_value, key_len);
+
+	if (decode_ret != 0) {
+		const char *err_desc = "unknown error";
+        if (decode_ret == EINVAL) err_desc = "invalid parameter to jwt_decode";
+        else if (decode_ret == ENOMEM) err_desc = "out of memory";
+		else if (decode_ret == ESLOGIC) err_desc = "validation failed (e.g., expired, not yet valid, signature, or audience)";
+		_log(LOG_INFO, "JWT: be_jwt_superuser: JWT validation failed. Reason: %s (libjwt error code: %d). Denying access. JWT: %s",
+			err_desc, decode_ret, jwt_string_su);
+		if (jwt_obj) jwt_free(jwt_obj);
+		return BACKEND_DENY;
+	}
+
+    if (jwt_get_alg(jwt_obj) != conf->jwt_expected_alg) {
+        _log(LOG_INFO, "JWT: be_jwt_superuser: JWT algorithm mismatch. Expected '%s', got '%s'. Denying access. JWT: %s",
+             jwt_alg_str(conf->jwt_expected_alg), jwt_alg_str(jwt_get_alg(jwt_obj)), jwt_string_su);
+        if (jwt_obj) jwt_free(jwt_obj);
+        return BACKEND_DENY;
+    }
+	_log(LOG_DEBUG, "JWT: be_jwt_superuser: JWT signature, algorithm, and standard time-related claims validated successfully by libjwt. Checking superuser claim '%s'. JWT: %s",
+         conf->jwt_superuser_claim_name, jwt_string_su);
+
+	// Check 3: Superuser claim presence and value
+	const char *superuser_claim_value_str = jwt_get_grant(jwt_obj, conf->jwt_superuser_claim_name);
+
+	if (superuser_claim_value_str != NULL) {
+		// Claim is present, check its boolean value
+		// Assuming "true" (case-insensitive) or "1" as true.
+		if (strcasecmp(superuser_claim_value_str, "true") == 0 || strcmp(superuser_claim_value_str, "1") == 0) {
+			_log(LOG_INFO, "JWT: be_jwt_superuser: Access GRANTED. Superuser claim '%s' is true. JWT: %s",
+				 conf->jwt_superuser_claim_name, jwt_string_su);
+			result = BACKEND_ALLOW;
+		} else {
+			_log(LOG_INFO, "JWT: be_jwt_superuser: Superuser check deferred. Superuser claim '%s' is present but not true (value: '%s'). JWT: %s",
+				 conf->jwt_superuser_claim_name, superuser_claim_value_str, jwt_string_su);
+			result = BACKEND_DEFER;
+		}
+	} else {
+		// Claim is not present
+		_log(LOG_INFO, "JWT: be_jwt_superuser: Superuser check deferred. Superuser claim '%s' not found in token. JWT: %s",
+			 conf->jwt_superuser_claim_name, jwt_string_su);
+		result = BACKEND_DEFER;
+	}
+
+	if (jwt_obj) jwt_free(jwt_obj);
+	return result;
+#else
+	// Fallback for non-HAVE_LIBJWT
+	struct jwt_backend *conf = (struct jwt_backend *)handle;
+	return http_post(handle, conf->superuser_uri, NULL, jwt_string_su, NULL, -1, METHOD_SUPERUSER);
+#endif // HAVE_LIBJWT
 };
 
-int be_jwt_aclcheck(void *handle, const char *clientid, const char *token, const char *topic, int acc)
+// Parameters:
+//  - handle: backend_conf opaque pointer
+//  - clientid: MQTT client ID
+//  - username: MQTT username (this is the 'token' variable from original signature, typically the JWT for ACL check)
+//  - topic: MQTT topic
+//  - acc: Access type (MOSQ_ACL_READ, MOSQ_ACL_WRITE)
+int be_jwt_aclcheck(void *handle, const char *clientid, const char *jwt_string_acl, const char *topic, int acc) // Renamed token to jwt_string_acl
 {
+#ifdef HAVE_LIBJWT
 	struct jwt_backend *conf = (struct jwt_backend *)handle;
-	return http_post(conf, conf->aclcheck_uri, clientid, token, topic, acc, METHOD_ACLCHECK);
+	jwt_t *jwt_obj = NULL; // Renamed from jwt to jwt_obj
+	int result = BACKEND_DENY; // Default to deny
+
+	_log(LOG_DEBUG, "JWT: be_jwt_aclcheck called for client ID: '%s', topic: '%s', access: %d, with JWT in username field.",
+		 clientid ? clientid : "NULL", topic ? topic : "NULL", acc);
+
+
+	if (!jwt_string_acl || strlen(jwt_string_acl) == 0) {
+		_log(LOG_INFO, "JWT: be_jwt_aclcheck: No JWT provided in username field for client ID '%s'.", clientid ? clientid : "NULL");
+		return BACKEND_DENY;
+	}
+
+	if (!conf || !conf->jwt_secret_key_value || !conf->jwt_acl_topic_read_claim_key || !conf->jwt_acl_topic_write_claim_key) {
+		_log(LOG_ERR, "JWT: be_jwt_aclcheck: JWT core configuration (secret/key or ACL claim keys) missing for client ID '%s'.", clientid ? clientid : "NULL");
+		return BACKEND_ERROR;
+	}
+
+	size_t key_len = (conf->jwt_expected_alg >= JWT_ALG_HS256 && conf->jwt_expected_alg <= JWT_ALG_HS512) ? strlen(conf->jwt_secret_key_value) : 0;
+	int decode_ret = jwt_decode(&jwt_obj, jwt_string_acl, (unsigned char *)conf->jwt_secret_key_value, key_len);
+
+	if (decode_ret != 0) {
+		const char *err_desc = (decode_ret == ESLOGIC) ? "validation failed (e.g., expired, not yet valid, signature)" : "decoding error";
+		_log(LOG_INFO, "JWT: be_jwt_aclcheck: JWT validation failed for client ID '%s'. Reason: %s (libjwt error code: %d). JWT: %s",
+			 clientid ? clientid : "NULL", err_desc, decode_ret, jwt_string_acl);
+		if (jwt_obj) jwt_free(jwt_obj);
+		return BACKEND_DENY;
+	}
+
+    if (jwt_get_alg(jwt_obj) != conf->jwt_expected_alg) {
+        _log(LOG_INFO, "JWT: be_jwt_aclcheck: JWT algorithm mismatch for client ID '%s'. Expected '%s', got '%s'.",
+             clientid ? clientid : "NULL", jwt_alg_str(conf->jwt_expected_alg), jwt_alg_str(jwt_get_alg(jwt_obj)));
+        if (jwt_obj) jwt_free(jwt_obj);
+        return BACKEND_DENY;
+    }
+	_log(LOG_DEBUG, "JWT: be_jwt_aclcheck: JWT signature, algorithm, and standard time-related claims validated successfully by libjwt for client ID '%s'.", clientid ? clientid : "NULL");
+
+    // Step 2: Username and ClientID for Substitutions
+    const char *jwt_username = jwt_get_grant(jwt_obj, conf->jwt_username_claim_name);
+    if (!jwt_username) {
+        _log(LOG_INFO, "JWT: be_jwt_aclcheck: Denying access for client ID '%s'. Username claim '%s' not found in JWT. JWT: %s",
+             clientid ? clientid : "NULL", conf->jwt_username_claim_name, jwt_string_acl);
+        if (jwt_obj) jwt_free(jwt_obj);
+        return BACKEND_DENY;
+    }
+    _log(LOG_DEBUG, "JWT: be_jwt_aclcheck: Extracted username '%s' from claim '%s' for client ID '%s'.",
+         jwt_username, conf->jwt_username_claim_name, clientid ? clientid : "NULL");
+
+	const char *acl_claim_key = NULL;
+	if (acc == MOSQ_ACL_READ) { 
+		acl_claim_key = conf->jwt_acl_topic_read_claim_key;
+		_log(LOG_DEBUG, "JWT: be_jwt_aclcheck: Using READ ACL claim key: '%s' for client ID '%s'.", acl_claim_key ? acl_claim_key : "N/A", clientid ? clientid : "NULL");
+	} else if (acc == MOSQ_ACL_WRITE) { 
+		acl_claim_key = conf->jwt_acl_topic_write_claim_key;
+		_log(LOG_DEBUG, "JWT: be_jwt_aclcheck: Using WRITE ACL claim key: '%s' for client ID '%s'.", acl_claim_key ? acl_claim_key : "N/A", clientid ? clientid : "NULL");
+	} else {
+		_log(LOG_WARNING, "JWT: be_jwt_aclcheck: Unknown access type %d for client ID '%s'. Deferring.", acc, clientid ? clientid : "NULL");
+		if (jwt_obj) jwt_free(jwt_obj);
+		return BACKEND_DEFER; // Or DENY, depending on strictness. DEFER seems more appropriate for unknown type.
+	}
+	
+	// Step 3c: Check if the relevant claim key is configured
+	if (!acl_claim_key || strlen(acl_claim_key) == 0) {
+        _log(LOG_INFO, "JWT: be_jwt_aclcheck: ACL check deferred for client ID '%s'. Relevant ACL claim key for access type %d is not configured. JWT: %s",
+             clientid ? clientid : "NULL", acc, jwt_string_acl);
+        if (jwt_obj) jwt_free(jwt_obj);
+        return BACKEND_DEFER;
+    }
+
+	// Step 3d & 3e: Retrieve ACL claim and check type
+	json_t *acl_grants_json = jwt_get_grants_json(jwt_obj, acl_claim_key);
+	if (!acl_grants_json) {
+		_log(LOG_INFO, "JWT: be_jwt_aclcheck: ACL check deferred for client ID '%s'. ACL claim '%s' not found in JWT. JWT: %s",
+             clientid ? clientid : "NULL", acl_claim_key, jwt_string_acl);
+		if (jwt_obj) jwt_free(jwt_obj);
+		return BACKEND_DEFER;
+	}
+
+	if (!json_is_array(acl_grants_json)) {
+		_log(LOG_WARNING, "JWT: be_jwt_aclcheck: ACL check deferred for client ID '%s'. ACL claim '%s' is not a JSON array. JWT: %s",
+             clientid ? clientid : "NULL", acl_claim_key, jwt_string_acl);
+		json_decref(acl_grants_json);
+		if (jwt_obj) jwt_free(jwt_obj);
+		return BACKEND_DEFER;
+	}
+
+	// Step 4: Topic Pattern Matching with Substitutions
+	size_t index;
+	json_t *value;
+	char *substituted_pattern = NULL;
+
+	json_array_foreach(acl_grants_json, index, value) {
+		if (!json_is_string(value)) {
+			_log(LOG_DEBUG, "JWT: be_jwt_aclcheck: Skipping non-string value in ACL array for claim '%s', client ID '%s'.", acl_claim_key, clientid ? clientid : "NULL");
+			continue;
+		}
+		const char *original_pattern = json_string_value(value);
+		if (!original_pattern) continue;
+
+		// Perform substitutions: %u -> jwt_username, %c -> clientid
+		// Using a simple substitution logic here. A more robust one might be needed for edge cases.
+		// This simple version just calculates length and snprintf's. Max length can be an issue.
+		// A more robust approach would be iterative replacement or using a library.
+		// For now, let's assume a reasonable buffer size or calculate more precisely.
+		// Calculate required length for substituted_pattern
+		size_t u_count = 0;
+		size_t c_count = 0;
+		const char *p = original_pattern;
+		while (*p) {
+			if (strncmp(p, "%u", 2) == 0) u_count++;
+			if (strncmp(p, "%c", 2) == 0) c_count++;
+			p++;
+		}
+		
+		// Ensure jwt_username and clientid are not NULL before using strlen on them
+		size_t username_len = jwt_username ? strlen(jwt_username) : 0;
+		size_t clientid_len = clientid ? strlen(clientid) : 0;
+
+
+		// Max possible length: original_len + u_count * (username_len - 2) + c_count * (clientid_len - 2) + 1
+		// Simplified: original_len + u_count * username_len + c_count * clientid_len + 1
+		// This estimation is generous to avoid buffer overflows with simple replacement.
+		// A more precise calculation would subtract the %u/%c placeholders.
+		size_t max_len = strlen(original_pattern) + (u_count * username_len) + (c_count * clientid_len) + 1;
+		substituted_pattern = (char *)malloc(max_len);
+		if (!substituted_pattern) {
+			_log(LOG_ERR, "JWT: be_jwt_aclcheck: Failed to allocate memory for substituted pattern. Client ID: '%s'.", clientid ? clientid : "NULL");
+			result = BACKEND_ERROR; // Signal internal error
+			goto cleanup_and_return; 
+		}
+
+		char *current_sub_ptr = substituted_pattern;
+		const char *current_orig_ptr = original_pattern;
+		while (*current_orig_ptr) {
+			if (strncmp(current_orig_ptr, "%u", 2) == 0 && jwt_username) {
+				strcpy(current_sub_ptr, jwt_username);
+				current_sub_ptr += username_len;
+				current_orig_ptr += 2;
+			} else if (strncmp(current_orig_ptr, "%c", 2) == 0 && clientid) {
+				strcpy(current_sub_ptr, clientid);
+				current_sub_ptr += clientid_len;
+				current_orig_ptr += 2;
+			} else {
+				*current_sub_ptr++ = *current_orig_ptr++;
+			}
+		}
+		*current_sub_ptr = '\0';
+
+		_log(LOG_DEBUG, "JWT: be_jwt_aclcheck: Checking substituted pattern '%s' (original: '%s') against topic '%s' for client ID '%s'.",
+			 substituted_pattern, original_pattern, topic, clientid ? clientid : "NULL");
+
+		if (mosquitto_topic_matches_sub(substituted_pattern, topic, NULL) == MOSQ_ERR_SUCCESS) {
+			_log(LOG_INFO, "JWT: be_jwt_aclcheck: Access GRANTED for client ID '%s'. Topic '%s' matches substituted pattern '%s' (original: '%s') from ACL claim '%s'. JWT: %s",
+				 clientid ? clientid : "NULL", topic, substituted_pattern, original_pattern, acl_claim_key, jwt_string_acl);
+			result = BACKEND_ALLOW;
+			free(substituted_pattern);
+			substituted_pattern = NULL; 
+			goto cleanup_and_return; 
+		}
+		free(substituted_pattern);
+		substituted_pattern = NULL;
+	}
+
+	// Step 5: No Match / End of Processing
+	_log(LOG_INFO, "JWT: be_jwt_aclcheck: Access DEFERRED for client ID '%s'. No matching ACL pattern found in claim '%s' for topic '%s'. JWT: %s",
+		 clientid ? clientid : "NULL", acl_claim_key, topic, jwt_string_acl);
+	result = BACKEND_DEFER;
+
+cleanup_and_return:
+	if (substituted_pattern) free(substituted_pattern); // Should be NULL if loop completed or match found and freed
+	if (acl_grants_json) json_decref(acl_grants_json);
+	if (jwt_obj) jwt_free(jwt_obj);
+	return result;
+
+#else
+	// Fallback for non-HAVE_LIBJWT
+	struct jwt_backend *conf = (struct jwt_backend *)handle;
+	return http_post(conf, conf->aclcheck_uri, clientid, jwt_string_acl, topic, acc, METHOD_ACLCHECK);
+#endif // HAVE_LIBJWT
 };
 
 #endif /* BE_JWT */

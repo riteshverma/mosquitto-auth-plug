@@ -92,7 +92,15 @@ ifneq ($(BACKEND_JWT), no)
 	BACKENDS+= -DBE_JWT
 	BACKENDSTR += JWT
 
-	BE_LDADD += -lcurl
+	# Conditional libraries for JWT backend
+	ifeq ($(HAVE_LIBJWT),yes)
+		BE_LDADD += -ljwt -ljansson -lcrypto
+		# Add relevant CFLAGS for libjwt if needed, e.g., -I/path/to/libjwt/include
+		# BE_CFLAGS += -I/opt/local/include # Example for MacPorts
+	else
+		BE_LDADD += -lcurl
+		# Add relevant CFLAGS for curl if needed
+	endif
 	OBJS += be-jwt.o
 endif
 
@@ -189,8 +197,55 @@ $(CDBLIB):
 pwdb.cdb: pwdb.in
 	$(CDB) -c -m  pwdb.cdb pwdb.in
 clean :
-	rm -f *.o *.so np
+	rm -f *.o *.so np test_jwt test_jwt.o
 	(cd contrib/tinycdb-0.78; make realclean )
+
+# --- Tests ---
+# Common objects that might be needed by be-jwt.c or its direct includes, excluding other backends
+# log.o is needed as be-jwt.c calls _log()
+# envs.o for p_stab, though test setup bypasses it for direct config struct population.
+# base64.o and hash.o are included as potential utilities.
+COMMON_TEST_OBJS = log.o base64.o hash.o envs.o
+
+# For JWT tests, we must use libjwt, so HAVE_LIBJWT=yes is assumed for this test build.
+BE_JWT_LIBS_FOR_TESTING = -ljwt -ljansson -lcrypto
+
+# Specific CFLAGS for compiling test_jwt.c and be-jwt.c for testing.
+# Ensures HAVE_LIBJWT is defined, and includes paths to mosquitto sources for mosquitto_plugin.h.
+# Uses existing CFLAGS as a base for includes and general flags.
+TEST_JWT_CFLAGS = $(CFLAGS) -DHAVE_LIBJWT
+
+# Target to build the test_jwt executable
+test_jwt: test_jwt.o be-jwt.o $(COMMON_TEST_OBJS)
+	@echo "Linking test_jwt executable..."
+	$(CC) $(LDFLAGS) -o $@ $^ $(BE_JWT_LIBS_FOR_TESTING) $(OSSLIBS) $(LDADD) # Add LDADD for -lmosquitto if needed for mosquitto_topic_matches_sub
+
+# Compile test_jwt.c with specific flags
+test_jwt.o: test_jwt.c
+	$(CC) $(TEST_JWT_CFLAGS) -c -o $@ test_jwt.c
+
+# Rule to recompile be-jwt.o specifically for the test if needed,
+# ensuring HAVE_LIBJWT is defined. If the main CFLAGS already do this
+# when BACKEND_JWT=yes and HAVE_LIBJWT=yes, this might not be strictly necessary
+# but provides explicitness.
+# For now, assume the existing be-jwt.o compiled with main CFLAGS is sufficient
+# if BACKEND_JWT and HAVE_LIBJWT are set to yes.
+# If we need a special version of be-jwt.o for tests:
+# be-jwt-test.o: be-jwt.c be-jwt.h
+#	$(CC) $(TEST_JWT_CFLAGS) -c -o $@ be-jwt.c
+# And then link test_jwt with be-jwt-test.o instead of be-jwt.o
+
+# Target to run the JWT tests
+run_jwt_tests: test_jwt
+	@echo "Running JWT backend tests..."
+	./test_jwt
+
+# General test target
+test: run_jwt_tests
+# If other test targets exist, add them here:
+# test: run_jwt_tests run_other_tests
+
+.PHONY: test run_jwt_tests
 
 config.mk:
 	@echo "Please create your own config.mk file"

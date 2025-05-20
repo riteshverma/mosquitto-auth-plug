@@ -45,6 +45,23 @@ struct jwt_backend {
 	char *superuser_envs;
 	char *aclcheck_envs;
 	char *with_tls;
+
+#ifdef HAVE_LIBJWT
+	// Renamed from jwt_secret to jwt_secret_key_value for clarity, stores the actual secret or key content.
+	// If validation_type is "public_key_file", this will store the content of the public key file.
+	char *jwt_secret_key_value; 
+	// Renamed from jwt_alg to jwt_expected_alg
+	jwt_alg_t jwt_expected_alg;  
+
+	// New configuration fields
+	char *jwt_validation_type;          // e.g., "secret", "public_key_file"
+	char *jwt_public_key_path;        // Path to the public key file if type is "public_key_file"
+	
+	char *jwt_username_claim_name;      // Claim name for username (e.g., "sub", "username")
+	char *jwt_superuser_claim_name;     // Claim name for superuser boolean flag (e.g., "is_superuser")
+	char *jwt_acl_topic_read_claim_key; // Claim name for read ACLs (subscribe) (e.g., "mosq_acl_read")
+	char *jwt_acl_topic_write_claim_key;// Claim name for write ACLs (publish) (e.g., "mosq_acl_write")
+#endif
 };
 
 void *be_jwt_init();

@@ -6,7 +6,7 @@ BACKEND_REDIS ?= no
 BACKEND_POSTGRES ?= no
 BACKEND_LDAP ?= no
 BACKEND_HTTP ?= no
-BACKEND_JWT ?= no
+BACKEND_JWT ?= yes
 BACKEND_MONGO ?= no
 BACKEND_FILES ?= no
 BACKEND_MEMCACHED ?= no
@@ -30,3 +30,14 @@ SUPPORT_DJANGO_HASHERS ?= no
 # CFG_CFLAGS = -I/usr/local/Cellar/openssl/1.0.2l/include -I/usr/local/Cellar/mosquitto/1.4.12/include
 CFG_LDFLAGS =
 CFG_CFLAGS =
+
+# JWT Backend Options:
+# HAVE_LIBJWT: Controls the JWT implementation.
+#   - Set to "yes" (default) to use the libjwt-based implementation.
+#     Requires: libjwt, libjansson, and OpenSSL development packages.
+#     (e.g., on Debian/Ubuntu: libjwt-dev, libjansson-dev, libssl-dev)
+#   - Set to "no" to use the older cURL-based JWT implementation (HTTP GET requests).
+#     Requires: libcurl development package (e.g., libcurl4-openssl-dev).
+# To set this, create a 'config.mk' file (or copy from config.mk.in) and change the
+# HAVE_LIBJWT line, or override during make: `make HAVE_LIBJWT=no`
+HAVE_LIBJWT ?= yes

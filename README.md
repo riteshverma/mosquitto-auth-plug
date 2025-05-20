@@ -420,18 +420,149 @@ auth_opt_http_aclcheck_params domain=DOMAIN,port=PORT
 
 
 
-### JWT auth
+### JWT Authentication (libjwt based)
 
-The `jwt` back-end is for auth by [JWT-webtokens](https://jwt.io/). The JWT and HTTP configurations are identical, so please read the `http`-section above.
+This backend enables authentication and authorization using JSON Web Tokens (JWTs), processed locally by the `libjwt` library. This is the recommended JWT backend if `libjwt` and its dependencies are available.
 
-The `username` field is interpreted as the token-field and passed to the http-server in an Authorization-header.
+**Overview:**
+
+*   The plugin uses `libjwt` to parse and validate JWTs.
+*   The JWT is expected to be passed in the **MQTT username field**.
+*   The MQTT password field can be empty or contain any dummy value; it is ignored by this backend for authentication.
+
+**Dependencies:**
+
+To use this backend, the following development libraries are required at compile time:
+*   `libjwt-dev`
+*   `libjansson-dev` (a dependency of libjwt for JSON processing)
+*   `libssl-dev` (for cryptographic operations)
+
+On Debian/Ubuntu systems, these can be installed via:
+`sudo apt-get install libjwt-dev libjansson-dev libssl-dev`
+
+**Configuration Options (for `mosquitto.conf`):**
+
+All options for this backend are prefixed with `auth_opt_jwt_`.
+
+| Option                            | Default         | Required | Description                                                                                                                               |
+| --------------------------------- | --------------- | :------: | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `auth_opt_jwt_validation_type`    | "secret"        |    No    | Method for JWT validation: "secret" (shared secret for HS algorithms) or "public_key_file" (public key for RS/ES algorithms).             |
+| `auth_opt_jwt_secret_key`         |                 | Yes (if `validation_type` is "secret") | The shared secret string used for symmetric algorithms (e.g., HS256, HS384, HS512).                                       |
+| `auth_opt_jwt_public_key_path`    |                 | Yes (if `validation_type` is "public_key_file") | Filesystem path to the PEM-encoded public key file for asymmetric algorithms (e.g., RS256, ES256).                               |
+| `auth_opt_jwt_algorithm`          |                 |   **Yes**  | The expected JWT algorithm (e.g., "HS256", "RS256", "ES256"). This **must** match the algorithm used to sign the JWTs.                   |
+| `auth_opt_jwt_username_claim`     | "sub"           |    No    | The JWT claim name that holds the MQTT username. This username is used for ACL substitutions (`%u`).                                      |
+| `auth_opt_jwt_superuser_claim_name`|                 |    No    | Optional. The name of a boolean claim in the JWT that, if present and `true`, grants superuser status (bypassing ACL checks).             |
+| `auth_opt_jwt_acl_topic_read_claim_key`| "mosq_acl_read" |    No    | JWT claim key for an array of topic strings allowed for MQTT subscribe (read access).                                                       |
+| `auth_opt_jwt_acl_topic_write_claim_key`| "mosq_acl_write"|    No    | JWT claim key for an array of topic strings allowed for MQTT publish (write access).                                                      |
+
+**Example `mosquitto.conf` block:**
+
 ```
-Authorization: Bearer %token
+# --- JWT Authentication (libjwt based) ---
+auth_opt_backends jwt
+auth_opt_jwt_validation_type "secret"  # or "public_key_file"
+auth_opt_jwt_secret_key "your-very-secure-secret-key-for-hs256"
+# For RS256/ES256 etc., comment out secret_key and use public_key_path:
+# auth_opt_jwt_public_key_path "/path/to/your/jwt_public_key.pem"
+auth_opt_jwt_algorithm "HS256" # Must match your JWT signing algorithm
+auth_opt_jwt_username_claim "sub"
+auth_opt_jwt_superuser_claim_name "is_superuser" # Optional
+auth_opt_jwt_acl_topic_read_claim_key "mosq_acl_read"
+auth_opt_jwt_acl_topic_write_claim_key "mosq_acl_write"
 ```
 
-**Note**: Some clients require the `password` field to be populated. This field is ignored by the JWT-backend, so feel free to input some gibberish.
+**Expected JWT Structure and Claims:**
 
+The plugin validates standard JWT claims and expects certain custom claims for its operation:
 
+*   **Standard Claims validated by `libjwt`:**
+    *   `alg`: Algorithm - Must match the `auth_opt_jwt_algorithm` setting.
+    *   `exp`: Expiration Time - Token must not be expired.
+    *   `nbf`: Not Before - Token must be currently valid (not used before this time).
+    *   `iat`: Issued At - Token issue time (validated if present, ensuring it's not in the future).
+*   **Custom Claims for MQTT Authorization:**
+    *   **Username Claim** (e.g., `"sub": "mqtt_user"`): A string claim whose name is defined by `auth_opt_jwt_username_claim`. The value of this claim is treated as the MQTT username for logging and for substitutions in ACL topic patterns.
+    *   **Superuser Claim** (e.g., `"is_superuser": true`): An optional boolean claim. If `auth_opt_jwt_superuser_claim_name` is configured and this claim is present and `true`, the user is granted superuser privileges.
+    *   **ACL Claims** (e.g., `"mosq_acl_read": ["topic1/#", "user/%u/files", "%c/status"], "mosq_acl_write": ["user/%u/cmd"]`):
+        *   These are expected to be JSON arrays of topic strings. The claim keys are defined by `auth_opt_jwt_acl_topic_read_claim_key` and `auth_opt_jwt_acl_topic_write_claim_key`.
+        *   Topic strings within these arrays can contain placeholders:
+            *   `%u`: Substituted with the username extracted from the JWT's username claim.
+            *   `%c`: Substituted with the MQTT client ID of the connecting client.
+        *   Standard MQTT wildcards (`+` and `#`) can be used in these topic patterns.
+
+**Example Decoded JWT Payload:**
+
+```json
+{
+  "iss": "my-auth-server",
+  "sub": "user_from_token", // Username claim
+  "exp": 1700003600,        // Example: Expires in 1 hour from iat
+  "iat": 1700000000,
+  "nbf": 1700000000,
+  "aud": "mqtt_broker",     // Optional audience claim
+  "is_superuser": false,    // Superuser claim
+  "mosq_acl_read": [        // Read (subscribe) ACLs
+    "public/data/#",
+    "client/%c/status",
+    "private/user/%u/messages/#"
+  ],
+  "mosq_acl_write": [       // Write (publish) ACLs
+    "private/user/%u/control",
+    "public/command/%c"
+  ]
+}
+```
+
+**MQTT Client Configuration Example:**
+
+To connect with an MQTT client, provide the full JWT string as the username and the password can be empty or any dummy string.
+
+```bash
+mosquitto_pub -h localhost -p 1883 -u "<YOUR_JWT_STRING_HERE>" -P "" -t "private/user/user_from_token/control" -m "test_message"
+```
+
+**Generating Example JWTs (Conceptual):**
+
+JWTs should be generated by a trusted external Identity Provider (IdP) or authentication service. Here's a conceptual Python example using `PyJWT` for generating an HS256 token:
+
+```python
+# Python example (conceptual - requires PyJWT library: pip install pyjwt)
+import jwt
+import time
+
+# Configuration (match these with your mosquitto-auth-plug settings)
+mqtt_username_from_idp = "john_doe"
+client_id_for_acl = "client123" # This would be dynamic if %c is used for specific clients
+secret_key = "your-very-secure-secret-key-for-hs256"
+algorithm = "HS256"
+
+payload = {
+    "iss": "my_auth_service",
+    "sub": mqtt_username_from_idp, # Corresponds to auth_opt_jwt_username_claim
+    "exp": int(time.time()) + 3600, # Expires in 1 hour
+    "iat": int(time.time()),        # Issued at current time
+    "nbf": int(time.time()),        # Not before current time
+    
+    # Custom claims for mosquitto-auth-plug
+    "is_superuser": False,        # Corresponds to auth_opt_jwt_superuser_claim_name
+    "mosq_acl_read": [            # Corresponds to auth_opt_jwt_acl_topic_read_claim_key
+        "public/metrics/#",
+        "private/%u/alerts/#",    # %u will be replaced by "john_doe"
+        "clients/%c/status"       # %c will be replaced by the connecting client's ID
+    ],
+    "mosq_acl_write": [           # Corresponds to auth_opt_jwt_acl_topic_write_claim_key
+        "private/%u/commands"
+    ]
+}
+
+# Generate the token
+encoded_jwt = jwt.encode(payload, secret_key, algorithm=algorithm)
+print(f"Generated JWT: {encoded_jwt}")
+```
+
+**Build Option:**
+
+The `libjwt`-based backend is enabled by default if the `libjwt-dev` package (and its dependencies `libjansson-dev`, `libssl-dev`) are detected during the build. To use the older cURL-based JWT implementation (which makes HTTP GET requests), you can compile the plugin with `HAVE_LIBJWT=no`. See `config.mk.in` for more details on build-time options.
 
 ### PostgreSQL auth
 
